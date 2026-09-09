@@ -444,14 +444,14 @@ def upload_erpnext_item(doc, method=None):
 			else:
 				variant_attributes = _get_variant_attributes(item, template_item)
 				existing_variant = get_matching_shopify_variant(product, item, variant_attributes)
-				# Do not PUT options/variants on the product. Shopify treats that as
-				# creating variants and returns "The variant 'X' already exists".
-				is_successful = _save_shopify_product_without_variants(product)
+				# Update the Shopify variant by id. Never append onto product.variants —
+				# that is what sends a third variant without id and triggers
+				# "The variant 'Orange/Blue' already exists".
+				is_successful, shopify_resource = _upsert_shopify_variant(
+					product, item, variant_attributes, existing_variant
+				)
 				if is_successful:
-					is_successful, shopify_resource = _upsert_shopify_variant(
-						product, item, variant_attributes, existing_variant
-					)
-				if is_successful:
+					_save_shopify_product_without_variants(product)
 					product = Product.find(product_id)
 					map_erpnext_variant_to_shopify_variant(product, item, variant_attributes)
 
@@ -467,22 +467,36 @@ def upload_erpnext_item(doc, method=None):
 def get_matching_shopify_variant(shopify_product: Product, erpnext_item, variant_attributes):
 	"""Return an existing Shopify variant for this ERPNext item, if any.
 
-	Match by linked Ecommerce Item variant_id first, then by option values.
+	Match by Ecommerce Item variant_id, then SKU, then option values.
 	"""
+	variants = list(getattr(shopify_product, "variants", None) or [])
+
 	variant_id = frappe.db.get_value(
 		"Ecommerce Item",
 		{"erpnext_item_code": erpnext_item.name, "integration": MODULE_NAME},
 		"variant_id",
 	)
 	if variant_id:
-		for variant in shopify_product.variants:
-			if str(variant.id) == str(variant_id):
+		for variant in variants:
+			if str(_variant_attr(variant, "id") or "") == str(variant_id):
 				return variant
 
-	for variant in shopify_product.variants:
+	sku = cstr(variant_attributes.get("sku") or getattr(erpnext_item, "item_code", "")).strip()
+	if sku:
+		for variant in variants:
+			if cstr(_variant_attr(variant, "sku")).strip() == sku:
+				return variant
+
+	for variant in variants:
 		if _variant_options_match(variant, variant_attributes):
 			return variant
 	return None
+
+
+def _variant_attr(variant, key):
+	if isinstance(variant, dict):
+		return variant.get(key)
+	return getattr(variant, key, None)
 
 
 def _normalize_variant_option(value) -> str:
@@ -491,7 +505,7 @@ def _normalize_variant_option(value) -> str:
 
 def _variant_options_match(variant, variant_attributes) -> bool:
 	for option_key in ("option1", "option2", "option3"):
-		if _normalize_variant_option(getattr(variant, option_key, None)) != _normalize_variant_option(
+		if _normalize_variant_option(_variant_attr(variant, option_key)) != _normalize_variant_option(
 			variant_attributes.get(option_key)
 		):
 			return False
@@ -500,28 +514,42 @@ def _variant_options_match(variant, variant_attributes) -> bool:
 
 def _get_variant_attributes(item, template_item) -> dict:
 	variant_attributes = {"sku": item.item_code, "price": item.get(ITEM_SELLING_RATE_FIELD)}
+	item_attr_values = {d.attribute: d.attribute_value for d in item.attributes}
 	max_index_range = min(3, len(template_item.attributes))
 	for i in range(0, max_index_range):
-		attr = template_item.attributes[i]
-		try:
-			variant_attributes[f"option{i+1}"] = item.attributes[i].attribute_value
-		except IndexError:
-			frappe.throw(_("Shopify Error: Missing value for attribute {}").format(attr.attribute))
+		attr_name = template_item.attributes[i].attribute
+		if attr_name not in item_attr_values:
+			frappe.throw(_("Shopify Error: Missing value for attribute {}").format(attr_name))
+		variant_attributes[f"option{i+1}"] = item_attr_values[attr_name]
 	return variant_attributes
 
 
 def _save_shopify_product_without_variants(product: Product) -> bool:
-	"""Update product fields without sending options or variants."""
-	attributes = getattr(product, "attributes", None)
+	"""Update product title/body without sending options or variants."""
+	update = Product()
+	update.id = product.id
+	update.title = product.title
+	update.body_html = product.body_html
+	update.product_type = product.product_type
+	if getattr(product, "status", None):
+		update.status = product.status
+	if getattr(product, "published", None) is not None:
+		update.published = product.published
+	if getattr(product, "weight", None) is not None:
+		update.weight = product.weight
+	if getattr(product, "weight_unit", None):
+		update.weight_unit = product.weight_unit
+
+	attributes = getattr(update, "attributes", None)
 	if attributes:
 		for key in ("variants", "options", "image", "images"):
 			attributes.pop(key, None)
-	return product.save()
+	return update.save()
 
 
 def _upsert_shopify_variant(product: Product, item, variant_attributes, existing_variant=None):
 	"""Update an existing Shopify variant by id, or create one only if missing."""
-	variant_id = getattr(existing_variant, "id", None) if existing_variant else None
+	variant_id = _variant_attr(existing_variant, "id") if existing_variant else None
 	if not variant_id:
 		variant_id = frappe.db.get_value(
 			"Ecommerce Item",
@@ -532,11 +560,17 @@ def _upsert_shopify_variant(product: Product, item, variant_attributes, existing
 	if variant_id:
 		shopify_variant = Variant.find(variant_id)
 		update_shopify_variant_properties(shopify_variant, item, variant_attributes)
-	else:
-		shopify_variant = Variant(variant_attributes)
-		shopify_variant.product_id = product.id
-		if item.is_stock_item:
-			shopify_variant.inventory_management = "shopify"
+		return shopify_variant.save(), shopify_variant
+
+	shopify_variant = Variant()
+	shopify_variant.product_id = product.id
+	shopify_variant.sku = variant_attributes.get("sku")
+	shopify_variant.price = variant_attributes.get("price")
+	for option_key in ("option1", "option2", "option3"):
+		if option_key in variant_attributes:
+			setattr(shopify_variant, option_key, variant_attributes[option_key])
+	if item.is_stock_item:
+		shopify_variant.inventory_management = "shopify"
 
 	return shopify_variant.save(), shopify_variant
 
@@ -665,6 +699,15 @@ def write_upload_log(
 		create_shopify_log(
 			status="Success",
 			request_data=product.to_dict(),
-			message=f"{action} Item: {item.name}, shopify product: {product.id}",
+			message=(
+				f"{action} Item: {item.name}, shopify product: {product.id}"
+				+ (
+					f", shopify variant: {shopify_resource.id}"
+					if shopify_resource is not None
+					and shopify_resource is not product
+					and getattr(shopify_resource, "id", None)
+					else ""
+				)
+			),
 			method="upload_erpnext_item",
 		)

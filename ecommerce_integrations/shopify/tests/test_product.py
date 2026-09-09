@@ -134,6 +134,23 @@ class TestProduct(TestCase):
 		)
 		self.assertEqual(str(matched.id), "222")
 
+	def test_get_matching_shopify_variant_by_sku(self):
+		from types import SimpleNamespace
+
+		from ecommerce_integrations.shopify.product import get_matching_shopify_variant
+
+		shopify_product = SimpleNamespace(
+			variants=[
+				SimpleNamespace(id="4841", option1="Orange", option2=None, option3=None, sku="TDD-N0001-ORG"),
+				SimpleNamespace(id="4842", option1="Blue", option2=None, option3=None, sku="TDD-N0001-BLU"),
+			]
+		)
+		erpnext_item = SimpleNamespace(name="TDD-N0001-BLU", item_code="TDD-N0001-BLU")
+		matched = get_matching_shopify_variant(
+			shopify_product, erpnext_item, {"option1": "Blue", "sku": "TDD-N0001-BLU", "price": 1200.0}
+		)
+		self.assertEqual(str(matched.id), "4842")
+
 
 def create_item_attributes():
 	if not frappe.db.exists("Item Attribute", "Test Sync Size"):
