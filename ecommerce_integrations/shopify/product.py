@@ -433,43 +433,35 @@ def upload_erpnext_item(doc, method=None):
 		product = Product.find(product_id)
 		if product:
 			map_erpnext_item_to_shopify(shopify_product=product, erpnext_item=template_item)
+			shopify_resource = product
 			if not item.variant_of:
 				update_default_variant_properties(
 					product,
 					is_stock_item=template_item.is_stock_item,
 					price=item.get(ITEM_SELLING_RATE_FIELD),
 				)
+				is_successful = product.save()
 			else:
-				variant_attributes = {"sku": item.item_code, "price": item.get(ITEM_SELLING_RATE_FIELD)}
-				product.options = []
-				max_index_range = min(3, len(template_item.attributes))
-				for i in range(0, max_index_range):
-					attr = template_item.attributes[i]
-					product.options.append(
-						{
-							"name": attr.attribute,
-							"values": frappe.db.get_all(
-								"Item Attribute Value", {"parent": attr.attribute}, pluck="attribute_value"
-							),
-						}
-					)
-					try:
-						variant_attributes[f"option{i+1}"] = item.attributes[i].attribute_value
-					except IndexError:
-						frappe.throw(
-							_("Shopify Error: Missing value for attribute {}").format(attr.attribute)
-						)
+				variant_attributes = _get_variant_attributes(item, template_item)
 				existing_variant = get_matching_shopify_variant(product, item, variant_attributes)
-				if existing_variant:
-					update_shopify_variant_properties(existing_variant, item, variant_attributes)
-				else:
-					product.variants.append(Variant(variant_attributes))
+				# Do not PUT options/variants on the product. Shopify treats that as
+				# creating variants and returns "The variant 'X' already exists".
+				is_successful = _save_shopify_product_without_variants(product)
+				if is_successful:
+					is_successful, shopify_resource = _upsert_shopify_variant(
+						product, item, variant_attributes, existing_variant
+					)
+				if is_successful:
+					product = Product.find(product_id)
+					map_erpnext_variant_to_shopify_variant(product, item, variant_attributes)
 
-			is_successful = product.save()
-			if is_successful and item.variant_of:
-				map_erpnext_variant_to_shopify_variant(product, item, variant_attributes)
-
-			write_upload_log(status=is_successful, product=product, item=item, action="Updated")
+			write_upload_log(
+				status=is_successful,
+				product=product,
+				item=item,
+				action="Updated",
+				shopify_resource=shopify_resource,
+			)
 
 
 def get_matching_shopify_variant(shopify_product: Product, erpnext_item, variant_attributes):
@@ -506,8 +498,55 @@ def _variant_options_match(variant, variant_attributes) -> bool:
 	return True
 
 
+def _get_variant_attributes(item, template_item) -> dict:
+	variant_attributes = {"sku": item.item_code, "price": item.get(ITEM_SELLING_RATE_FIELD)}
+	max_index_range = min(3, len(template_item.attributes))
+	for i in range(0, max_index_range):
+		attr = template_item.attributes[i]
+		try:
+			variant_attributes[f"option{i+1}"] = item.attributes[i].attribute_value
+		except IndexError:
+			frappe.throw(_("Shopify Error: Missing value for attribute {}").format(attr.attribute))
+	return variant_attributes
+
+
+def _save_shopify_product_without_variants(product: Product) -> bool:
+	"""Update product fields without sending options or variants."""
+	attributes = getattr(product, "attributes", None)
+	if attributes:
+		for key in ("variants", "options", "image", "images"):
+			attributes.pop(key, None)
+	return product.save()
+
+
+def _upsert_shopify_variant(product: Product, item, variant_attributes, existing_variant=None):
+	"""Update an existing Shopify variant by id, or create one only if missing."""
+	variant_id = getattr(existing_variant, "id", None) if existing_variant else None
+	if not variant_id:
+		variant_id = frappe.db.get_value(
+			"Ecommerce Item",
+			{"erpnext_item_code": item.name, "integration": MODULE_NAME},
+			"variant_id",
+		)
+
+	if variant_id:
+		shopify_variant = Variant.find(variant_id)
+		update_shopify_variant_properties(shopify_variant, item, variant_attributes)
+	else:
+		shopify_variant = Variant(variant_attributes)
+		shopify_variant.product_id = product.id
+		if item.is_stock_item:
+			shopify_variant.inventory_management = "shopify"
+
+	return shopify_variant.save(), shopify_variant
+
+
 def update_shopify_variant_properties(shopify_variant: Variant, erpnext_item, variant_attributes):
-	"""Update SKU, price, options, and inventory on an existing Shopify variant."""
+	"""Update SKU, price, and inventory on an existing Shopify variant.
+
+	Option values are only sent when they actually changed. Re-posting the same
+	combination is what triggers Shopify's "The variant already exists" error.
+	"""
 	if erpnext_item.is_stock_item:
 		shopify_variant.inventory_management = "shopify"
 
@@ -517,8 +556,13 @@ def update_shopify_variant_properties(shopify_variant: Variant, erpnext_item, va
 		shopify_variant.sku = variant_attributes.get("sku")
 
 	for option_key in ("option1", "option2", "option3"):
-		if option_key in variant_attributes:
-			setattr(shopify_variant, option_key, variant_attributes[option_key])
+		if option_key not in variant_attributes:
+			continue
+		new_value = variant_attributes[option_key]
+		if _normalize_variant_option(getattr(shopify_variant, option_key, None)) != _normalize_variant_option(
+			new_value
+		):
+			setattr(shopify_variant, option_key, new_value)
 
 
 def map_erpnext_variant_to_shopify_variant(shopify_product: Product, erpnext_item, variant_attributes):
@@ -599,15 +643,21 @@ def update_default_variant_properties(
 		default_variant.sku = sku
 
 
-def write_upload_log(status: bool, product: Product, item, action="Created") -> None:
+def write_upload_log(
+	status: bool, product: Product, item, action="Created", shopify_resource=None
+) -> None:
+	resource = shopify_resource or product
 	if not status:
 		msg = _("Failed to upload item to Shopify") + "<br>"
-		msg += _("Shopify reported errors:") + " " + ", ".join(product.errors.full_messages())
+		errors = []
+		if getattr(resource, "errors", None):
+			errors = resource.errors.full_messages()
+		msg += _("Shopify reported errors:") + " " + ", ".join(errors)
 		msgprint(msg, title="Note", indicator="orange")
 
 		create_shopify_log(
 			status="Error",
-			request_data=product.to_dict(),
+			request_data=resource.to_dict(),
 			message=msg,
 			method="upload_erpnext_item",
 		)
